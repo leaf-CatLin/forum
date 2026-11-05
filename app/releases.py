@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """客户端发布信息（「下载」页与更新检查共用）。
 
-* 数据源：服务端 ``GET /api/app/releases``（见 :data:`app.constants.APP_RELEASES_API`）
+* 数据源：优先新版远端 ``GET /ov2/api/downloads/releases``（扁平 items，按 platform 分组），
+  失败时回退旧版 ``GET /api/app/releases``（见 :data:`app.constants.APP_RELEASES_API`）
 * 远端不可达时回退到内置的 :data:`_fallback_platforms`，并把 ``known`` 记为 False
 * 带 TTL 缓存 + 线程锁；对外函数都不抛异常
 * ``known`` / ``source`` 用于区分「真实清单」与「离线兜底」，供更新检查判定
@@ -236,6 +237,30 @@ def _parse_catalog(data: dict) -> dict:
     return out
 
 
+def _catalog_from_downloads(data: dict) -> dict:
+    """解析新版 ``/ov2/api/downloads/releases``：扁平 items，每条自带 platform。"""
+    items = data.get("items")
+    if not isinstance(items, list):
+        return {}
+    grouped: dict = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = _text(item.get("platform"))
+        if key:
+            grouped.setdefault(key, []).append(item)
+    out: dict = {}
+    for key, rows in grouped.items():
+        releases = [r for r in (Release.from_dict(row) for row in rows)
+                    if r.version or r.url]
+        releases.sort(key=lambda r: _version_parts(r.version), reverse=True)
+        out[key] = PlatformInfo(
+            key=key, label=PLATFORM_LABELS.get(key, str(key).title()),
+            status=STATUS_AVAILABLE if releases else STATUS_COMING_SOON,
+            note="", releases=releases)
+    return out
+
+
 def _fallback_platforms() -> dict:
     out: dict = {}
     for key in PLATFORM_ORDER:
@@ -259,9 +284,25 @@ _cache: "ReleaseCatalog | None" = None
 
 
 def _fetch() -> tuple:
-    """拉取远端清单；返回 ``(原始字典, 是否成功)``。"""
+    """拉取远端清单；返回 ``(平台字典, 是否成功)``。新版接口优先，旧接口兜底。"""
     try:
-        result = api_mod.api().get(constants.APP_RELEASES_API)
+        client = api_mod.api()
+    except Exception as exc:  # noqa: BLE001
+        _log.info("获取 API 客户端失败：%s", exc)
+        return {}, False
+
+    try:
+        result = client.get("/ov2/api/downloads/releases", page=1, page_size=100)
+    except Exception as exc:  # noqa: BLE001
+        _log.info("新版发布接口请求失败：%s", exc)
+        result = None
+    if result is not None and result.ok:
+        catalog = _catalog_from_downloads(result.data)
+        if catalog:
+            return catalog, True
+
+    try:
+        result = client.get(constants.APP_RELEASES_API)
     except Exception as exc:  # noqa: BLE001
         _log.info("拉取发布清单失败：%s", exc)
         return {}, False
@@ -271,7 +312,7 @@ def _fetch() -> tuple:
     data = result.data
     if not isinstance(data, dict):
         return {}, False
-    return data, True
+    return _parse_catalog(data), True
 
 
 def platforms(refresh: bool = False) -> ReleaseCatalog:
@@ -286,7 +327,7 @@ def platforms(refresh: bool = False) -> ReleaseCatalog:
     with _lock:
         if known:
             merged = _fallback_platforms()
-            merged.update(_parse_catalog(data))
+            merged.update(data)
             _cache = ReleaseCatalog(platforms=merged, known=True,
                                     source="server", fetched_at=time.time())
         elif _cache is not None:

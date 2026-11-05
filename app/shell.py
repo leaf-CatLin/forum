@@ -30,16 +30,17 @@ from .widgets.world_panel import WorldPanel
 _log = logger.get_logger("shell")
 
 # 导航项：(路由, 图标名, 文字)。图标名对应 resources/icons/<name>.svg，
-# 由网页端同款 font-awesome@4.7.0 字形轮廓导出，两侧图形完全一致。
+# 统一使用线性描边（stroke）风格，且会被主题色重新着色。
 # 「下载」入口已从 APP 端移除（客户端本身就是下载产物，官网 /Download 已覆盖）。
 NAV_ITEMS = (
-    ("home", "home", "首页"),
-    ("forum", "list", "论坛"),
-    ("me", "user", "我的"),
-    ("world", "globe", "世界"),
-    ("wiki", "book", "WIKI"),
-    ("easter_egg", "gift", "彩蛋"),
-    ("settings", "cog", "设置"),
+    ("home", "home-line", "首页"),
+    ("forum", "comment-line", "论坛"),
+    ("messages", "bell-line", "消息"),
+    ("me", "user-line", "我的"),
+    ("world", "globe-line", "世界"),
+    ("wiki", "book-line", "WIKI"),
+    ("easter_egg", "sparkle-line", "彩蛋"),
+    ("settings", "settings-line", "设置"),
 )
 
 NAV_ICON_NAMES = {route: icon for route, icon, _label in NAV_ITEMS}
@@ -52,6 +53,7 @@ PAGE_MODULES = {
     "search": ("app.pages.search", "SearchPage"),
     "user": ("app.pages.user", "UserPage"),
     "me": ("app.pages.profile", "ProfilePage"),
+    "messages": ("app.pages.messages", "MessagesPage"),
     "world": ("app.pages.world", "WorldPage"),
     "wiki": ("app.pages.wiki", "WikiPage"),
     "auth": ("app.pages.auth", "AuthPage"),
@@ -145,6 +147,8 @@ class SideNav(QFrame):
         self._pinned = False          # 点击展开按钮后固定展开，鼠标离开不自动收起
         self._rows: dict[str, _NavRow] = {}
         self._texts: list[QLabel] = []
+        self._labels: dict[str, QLabel] = {}
+        self._badges: dict[str, int] = {}
         self._icon_rows: list[tuple[QLabel, _NavRow]] = []
 
         self._hover_timer = QTimer(self)
@@ -153,16 +157,19 @@ class SideNav(QFrame):
         self._hover_timer.timeout.connect(self._on_hover_timeout)
 
         root = vbox(self, margins=(6, 8, 6, 8), spacing=4)
-        self._toggle_row, self._toggle_icon = self._make_row(
+        self._toggle_row, self._toggle_icon, _ = self._make_row(
             "angle-right", "收起", self.toggle)
         self._toggle_row.setToolTip("展开 / 收起导航")
         root.addWidget(self._toggle_row)
         root.addSpacing(4)
 
         for route, icon_name, label in NAV_ITEMS:
-            row, _icon = self._make_row(
+            row, _icon, text = self._make_row(
                 icon_name, label, lambda r=route: self.navigate.emit(r))
             self._rows[route] = row
+            self._labels[route] = text
+            self._badges[route] = 0
+            text.setProperty("baseText", label)
             root.addWidget(row)
         root.addStretch(1)
 
@@ -179,7 +186,8 @@ class SideNav(QFrame):
         self.reload_theme()
 
     # ── 构建 ──
-    def _make_row(self, icon_name: str, label: str, on_click) -> tuple[_NavRow, QLabel]:
+    def _make_row(self, icon_name: str, label: str,
+                  on_click) -> tuple[_NavRow, QLabel, QLabel]:
         row = _NavRow(self)
         row.clicked.connect(on_click)
         layout = hbox(row, margins=(12, 0, 10, 0), spacing=10)
@@ -197,7 +205,7 @@ class SideNav(QFrame):
         self._texts.append(text)
         self._icon_rows.append((icon, row))
         row.state_changed.connect(lambda ic=icon, r=row: self._paint_icon(ic, r))
-        return row, icon
+        return row, icon, text
 
     # ── 图标着色 ──
     def _paint_icon(self, label: QLabel, row: _NavRow) -> None:
@@ -267,10 +275,18 @@ class SideNav(QFrame):
             self._pinned = True
             self.set_expanded(True)
 
-    # ── 高亮 ──
+    # ── 高亮 / 未读角标 ──
     def set_active(self, route: str) -> None:
         for key, row in self._rows.items():
             row.set_active(key == route)
+
+    def set_badge(self, route: str, count: int) -> None:
+        count = max(0, int(count or 0))
+        self._badges[route] = count
+        text = self._labels.get(route)
+        if text is not None:
+            base = str(text.property("baseText") or text.text())
+            text.setText(base + (" (%d)" % count if count else ""))
 
 
 class Shell(QMainWindow):
@@ -335,6 +351,12 @@ class Shell(QMainWindow):
         self.refresh_user()
         self.navigate("home", push_history=False)
         self.world_panel.start()
+
+        # 未读角标低频轮询（消息推送仍以后台请求为准，避免频繁打扰）
+        self._message_timer = QTimer(self)
+        self._message_timer.setInterval(120_000)
+        self._message_timer.timeout.connect(self.refresh_message_badge)
+        self._message_timer.start()
 
         api_mod.api().add_unauthorized_listener(self._on_unauthorized)
         self.version_blocked.connect(self._show_version_too_low)
@@ -403,6 +425,7 @@ class Shell(QMainWindow):
             btn = button(label, "ghost",
                          lambda _checked=False, r=route: self._on_nav(r),
                          icon=icon_name, icon_size=15)
+            btn.setProperty("baseText", label)
             self._top_nav_buttons[route] = btn
             self.top_nav.addWidget(btn)
 
@@ -417,6 +440,7 @@ class Shell(QMainWindow):
         def _done(_result=None):
             self._render_user_area()
             self.world_panel.refresh_user()
+            self.refresh_message_badge()
             page = self.stack.currentWidget()
             if page is not None:
                 checker = getattr(page, "refresh_auth", None)
@@ -431,6 +455,29 @@ class Shell(QMainWindow):
                      label="登录态")
         else:
             _done()
+
+    def refresh_message_badge(self) -> None:
+        """拉取未读汇总并刷新导航角标（未登录时清零）。"""
+        if not api_mod.api().user:
+            self.set_message_badge(0)
+            return
+        self.run(api_mod.api().message_summary, self._apply_message_badge,
+                 lambda _m: None, label="消息未读")
+
+    def _apply_message_badge(self, result) -> None:
+        if not result.ok:
+            return
+        total = sum(int(result.get(key) or 0)
+                    for key in ("likes", "comments", "system", "chat"))
+        self.set_message_badge(total)
+
+    def set_message_badge(self, total: int) -> None:
+        total = max(0, int(total or 0))
+        self.side_nav.set_badge("messages", total)
+        btn = getattr(self, "_top_nav_buttons", {}).get("messages")
+        if btn is not None:
+            base = str(btn.property("baseText") or btn.text())
+            btn.setText(base + (" (%d)" % total if total else ""))
 
     def _render_user_area(self) -> None:
         while self.user_layout.count():
@@ -455,6 +502,7 @@ class Shell(QMainWindow):
         else:
             login = button("登录", "primary", lambda: self.navigate("auth"))
             self.user_layout.addWidget(login)
+            self.set_message_badge(0)
         self._update_top_routes()
 
     def _update_top_routes(self) -> None:

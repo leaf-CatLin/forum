@@ -117,6 +117,7 @@ class MarkdownView(QTextBrowser):
         self.document().setDocumentMargin(4)
         self.document().setBaseUrl(QUrl(constants.BASE_URL + "/"))
         self._source = ""
+        self._html = ""
         self._mode = None
         self._requested: set[str] = set()
         self._rerender_scheduled = False
@@ -136,7 +137,10 @@ class MarkdownView(QTextBrowser):
     def reload_theme(self) -> None:
         """主题切换后重渲染。"""
         self._apply_style()
-        self.set_markdown(self._source)
+        if self._html:
+            self._set_html_document(self._html)
+        else:
+            self.set_markdown(self._source)
 
     # ── 内容 ──
     def source(self) -> str:
@@ -144,13 +148,28 @@ class MarkdownView(QTextBrowser):
 
     def set_markdown(self, text: str) -> None:
         self._source = text or ""
+        self._html = ""
         self._requested.clear()
         set_document_markdown(self.document(), self._source)
         self._resize_to_content()
 
+    def set_html(self, text: str) -> None:
+        """服务端已净化的 HTML 正文（新 API 的 ``content_format=html``）。"""
+        self._html = text or ""
+        self._source = ""
+        self._requested.clear()
+        self._set_html_document(self._html)
+        self._resize_to_content()
+
+    def _set_html_document(self, text: str) -> None:
+        self.document().setBaseUrl(QUrl(constants.BASE_URL + "/"))
+        self.setHtml(text)
+        self.document().setBaseUrl(QUrl(constants.BASE_URL + "/"))
+
     def set_raw_text(self, text: str) -> None:
         """纯文本（不做 Markdown 解析）。"""
         self._source = ""
+        self._html = ""
         self.setPlainText(text or "")
 
     def _resize_to_content(self) -> None:
@@ -207,11 +226,14 @@ class MarkdownView(QTextBrowser):
 
         def _do() -> None:
             self._rerender_scheduled = False
-            if not self._source:
+            if not self._source and not self._html:
                 return
             bar = self.verticalScrollBar()
             position = bar.value()
-            set_document_markdown(self.document(), self._source)
+            if self._html:
+                self._set_html_document(self._html)
+            else:
+                set_document_markdown(self.document(), self._source)
             bar.setValue(position)
 
         QTimer.singleShot(0, _do)

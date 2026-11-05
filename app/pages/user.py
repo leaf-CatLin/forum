@@ -259,7 +259,7 @@ class UserPage(Page):
         content = PlainLabel(str(comment.get("content") or ""), wrap=True)
         card.body.addWidget(content)
 
-        post_id = str(comment.get("_id") or "")
+        post_id = str(comment.get("post_id") or comment.get("_id") or "")
         title = str(comment.get("post_title") or "") or ("帖子 %s" % post_id)
         meta = hbox(spacing=6)
         meta.addWidget(Muted("评论于《%s》" % title))
@@ -316,10 +316,19 @@ class UserPage(Page):
             self.hint.setText(result.message or "用户加载失败")
             self.toast(result.message)
             return
-        user = result.get("user") or {}
+        user = dict(result.get("user") or {})
         if not user:
             self.hint.setText("用户不存在或已被封禁")
             return
+        # 新接口把统计信息放在顶层，这里并回 user，保持本页既有的读取方式
+        stats = dict(user.get("stats") or {})
+        if isinstance(result.get("stats"), dict):
+            stats.update(result.get("stats"))
+        if isinstance(result.get("follow_stats"), dict):
+            stats.update(result.get("follow_stats"))
+        user["stats"] = stats
+        user.setdefault("is_following", result.get("is_following"))
+        user.setdefault("is_self", result.get("is_self"))
         self.hint.setText("")
         self._user = user
         self._following = bool(user.get("is_following"))

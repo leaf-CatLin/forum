@@ -35,6 +35,19 @@ NOTICE_ITEMS = (
 )
 
 
+def _markdown_to_html(text: str) -> str:
+    """Markdown → 新 API 需要的富文本 HTML（新接口按 ``content_format=html`` 存储）。
+
+    依赖缺失时退化为「转义 + 换行」的纯文本 HTML，保证正文不会丢内容。
+    """
+    try:
+        import markdown
+        return markdown.markdown(text, extensions=("nl2br", "sane_lists"))
+    except Exception:  # noqa: BLE001
+        import html as _html
+        return "<p>%s</p>" % _html.escape(text).replace("\n", "<br>")
+
+
 class PostCreatePage(Page):
     """发布帖子：标题 + 分区 + Markdown 正文（编辑 / 预览）。"""
 
@@ -207,5 +220,5 @@ class PostCreatePage(Page):
             self._refresh_publish()
             self.hint.setText(message)
 
-        self.run(lambda: self.api.create_post(title, content, category),
+        self.run(lambda: self.api.create_post(title, _markdown_to_html(content), category),
                  _done, _fail, label="发布帖子")

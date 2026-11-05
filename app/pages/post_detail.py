@@ -263,7 +263,11 @@ class PostDetailPage(Page):
         self.title.setText(str(post.get("title") or "（无标题）"))
         self._likes = int(post.get("likes") or 0)
         self._views = int(post.get("views") or 0)
-        self.content.set_markdown(str(post.get("content") or ""))
+        content = str(post.get("content") or "")
+        if str(post.get("content_format") or "markdown") == "html":
+            self.content.set_html(content)
+        else:
+            self.content.set_markdown(content)
         me_id = str((self.me or {}).get("id") or "")
         self.delete_btn.setVisible(bool(uid) and uid == me_id)
         self._refresh_meta()

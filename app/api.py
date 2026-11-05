@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import html as _html
 import json as _json
+import re as _re
 import threading
 import time
 from pathlib import Path
@@ -48,6 +50,35 @@ CAPTCHA_PROTECTED_ENDPOINTS = (
     "/api/email/send-change-email-old-code",
     "/api/email/send-delete-account-code",
 )
+
+
+_TAG_RE = _re.compile(r"<[^>]+>")
+
+
+def _plain_text(value: Any) -> str:
+    """把服务端富文本（HTML）压成纯文本，供只做纯文本渲染的控件使用。"""
+    text = _TAG_RE.sub(" ", str(value or ""))
+    text = _html.unescape(text)
+    return _re.sub(r"\s+", " ", text).strip()
+
+
+def _plain_to_html(text: str) -> str:
+    """纯文本 → 富文本 HTML：转义尖括号，换行转 ``<br>``。"""
+    return "<p>%s</p>" % _html.escape(str(text or "")).replace("\n", "<br>")
+
+
+def _with_proof(payload: Any, altcha: str = "", grant: str = "") -> Any:
+    """并入 ALTCHA 证明字段（``altcha`` 或 ``grant``，空串不写入）。"""
+    if not isinstance(payload, dict):
+        return payload
+    body = dict(payload)
+    proof = str(altcha or "").strip()
+    g = str(grant or "").strip()
+    if proof:
+        body["altcha"] = proof
+    if g:
+        body["grant"] = g
+    return body
 
 
 def _with_captcha(payload: Any, captcha_token: str = "") -> Any:
@@ -411,6 +442,9 @@ class ForumApi:
     def put(self, path: str, payload: Any = None, **kw) -> Result:
         return self.request("PUT", path, json_body=payload, **kw)
 
+    def delete(self, path: str, payload: Any = None, **kw) -> Result:
+        return self.request("DELETE", path, json_body=payload, **kw)
+
     def run(self, fn: Callable[[], Any], on_success: Callable | None = None,
             on_error: Callable | None = None, label: str = "") -> None:
         """把一次接口调用丢到后台线程。"""
@@ -546,15 +580,25 @@ class ForumApi:
 
     # ─────────────── 用户 ───────────────
     def me(self) -> Result:
-        result = self.get("/api/user/info")
+        result = self.get("/ov2/api/users/me")
         if result.ok:
             user = result.get("user")
             if isinstance(user, dict):
-                self.set_user(user)
+                # 新接口把统计放在顶层；合并进 user，保持「我的」页既有读取方式
+                merged = dict(user)
+                stats = dict(merged.get("stats") or {})
+                if isinstance(result.get("stats"), dict):
+                    stats.update(result.get("stats"))
+                if isinstance(result.get("follow_stats"), dict):
+                    stats.update(result.get("follow_stats"))
+                merged["stats"] = stats
+                if isinstance(result.data, dict):
+                    result.data["user"] = merged
+                self.set_user(merged)
         return result
 
     def update_profile(self, **fields) -> Result:
-        result = self.put("/api/user/info", fields)
+        result = self.request("PATCH", "/ov2/api/users/me", json_body=fields)
         if result.ok:
             user = result.get("user")
             if isinstance(user, dict):
@@ -565,35 +609,54 @@ class ForumApi:
 
     def get_user(self, user_id: str) -> Result:
         """按 ID 查公开资料（注意：与 :attr:`user` 属性区分，历史命名的坑）。"""
-        return self.get("/api/user/%s" % user_id)
+        return self.get("/ov2/api/users/%s" % user_id)
 
     def follow(self, user_id: str) -> Result:
-        return self.post("/api/user/%s/follow" % user_id, {})
+        return self.post("/ov2/api/users/%s/follow" % user_id, {})
 
     def following(self, user_id: str, page: int = 1, page_size: int = 20) -> Result:
-        return self.get("/api/user/%s/following" % user_id,
+        return self.get("/ov2/api/users/%s/following" % user_id,
                         page=page, page_size=page_size)
 
     def followers(self, user_id: str, page: int = 1, page_size: int = 20) -> Result:
-        return self.get("/api/user/%s/followers" % user_id,
+        return self.get("/ov2/api/users/%s/followers" % user_id,
                         page=page, page_size=page_size)
 
     def user_posts(self, user_id: str, page: int = 1, page_size: int = 20) -> Result:
-        return self.get("/api/user/%s/posts" % user_id,
+        return self.get("/ov2/api/users/%s/posts" % user_id,
                         page=page, page_size=page_size)
 
     def user_favorites(self, user_id: str, page: int = 1,
                        page_size: int = 20) -> Result:
-        return self.get("/api/user/%s/favorites" % user_id,
+        return self.get("/ov2/api/users/%s/favorites" % user_id,
                         page=page, page_size=page_size)
 
     def user_comments(self, user_id: str, page: int = 1,
                       page_size: int = 20) -> Result:
-        return self.get("/api/user/%s/comments" % user_id,
-                        page=page, page_size=page_size)
+        result = self.get("/ov2/api/users/%s/comments" % user_id,
+                          page=page, page_size=page_size)
+        if result.ok:
+            for item in result.rows("comments"):
+                if isinstance(item, dict) and item.get("content_format") == "html":
+                    item["content"] = _plain_text(item.get("content"))
+        return result
 
     def my_replies(self, page: int = 1, page_size: int = 20) -> Result:
-        return self.get("/api/users/me/replies", page=page, page_size=page_size)
+        result = self.get("/ov2/api/users/me/replies", page=page, page_size=page_size)
+        if result.ok:
+            for row in result.rows("replies"):
+                if not isinstance(row, dict):
+                    continue
+                # 新接口回复带有完整评论字段，这里映射成「我的」页沿用的旧键名
+                content = row.get("content") or ""
+                if row.get("content_format") == "html":
+                    content = _plain_text(content)
+                row["replier_avatar"] = row.get("user_avatar") or ""
+                row["replier_id"] = row.get("user_id") or ""
+                row["replier_name"] = row.get("user_name") or ""
+                row["reply_created_at"] = row.get("created_at") or ""
+                row["reply_content"] = content
+        return result
 
     def upload_avatar(self, file_path: str | Path) -> Result:
         path = Path(file_path)
@@ -603,7 +666,7 @@ class ForumApi:
             return Result(0, None, "无法读取文件：%s" % exc)
         try:
             result = self.request(
-                "POST", "/api/user/avatar/upload",
+                "POST", "/ov2/api/users/me/avatar",
                 files={"avatar": (path.name, handle, "application/octet-stream")},
                 timeout=(15, 90), retries=0,
             )
@@ -623,84 +686,182 @@ class ForumApi:
     # ─────────────── 帖子 ───────────────
     def posts(self, page: int = 1, page_size: int = constants.PAGE_SIZE,
               category: str | None = None, sort: str | None = None) -> Result:
-        return self.get("/api/posts", page=page, page_size=page_size,
+        return self.get("/ov2/api/posts", page=page, page_size=page_size,
                         category=category, sort=sort)
 
     def random_posts(self, limit: int = 200) -> Result:
-        return self.get("/api/posts/random", limit=limit)
+        return self.get("/ov2/api/posts/random", limit=limit)
 
     def get_post(self, post_id: str) -> Result:
         """帖子详情（注意：与通用 ``post(path, payload)`` 区分）。"""
-        return self.get("/api/posts/%s" % post_id)
+        return self.get("/ov2/api/posts/%s" % post_id)
 
     def create_post(self, title: str, content: str, category: str = "general") -> Result:
-        return self.post("/api/posts/create", {
+        return self.post("/ov2/api/posts", {
             "title": title, "content": content, "category": category})
 
     def like_post(self, post_id: str) -> Result:
-        return self.post("/api/posts/%s/like" % post_id, {})
+        return self.post("/ov2/api/posts/%s/like" % post_id, {})
 
     def favorite_post(self, post_id: str) -> Result:
-        return self.post("/api/posts/%s/favorite" % post_id, {})
+        return self.post("/ov2/api/posts/%s/favorite" % post_id, {})
 
     def report_post(self, post_id: str, reason: str, detail: str = "") -> Result:
-        return self.post("/api/posts/%s/report" % post_id,
+        return self.post("/ov2/api/posts/%s/report" % post_id,
                          {"reason": reason, "detail": detail})
 
     def delete_post(self, post_id: str) -> Result:
-        return self.post("/api/posts/%s/delete" % post_id, {})
+        return self.post("/ov2/api/posts/%s/delete" % post_id, {})
 
     # ─────────────── 评论 ───────────────
     def comments(self, post_id: str, page: int = 1, page_size: int = 50) -> Result:
-        return self.get("/api/posts/%s/comments" % post_id,
-                        page=page, page_size=page_size)
+        result = self.get("/ov2/api/posts/%s/comments" % post_id,
+                          page=page, page_size=page_size)
+        if result.ok:
+            items = [x for x in result.rows("comments") if isinstance(x, dict)]
+            names = {str(x.get("id") or ""): str(x.get("user_name") or "") for x in items}
+            for item in items:
+                # 新接口字段名与旧 APP 契约不同：统一成窗口控件认识的形状
+                item["liked"] = bool(item.get("liked_by_me"))
+                if item.get("content_format") == "html":
+                    item["content"] = _plain_text(item.get("content"))
+                parent = item.get("parent_id")
+                if parent and not item.get("reply_to_name"):
+                    item["reply_to_name"] = names.get(str(parent), "")
+        return result
 
     def create_comment(self, post_id: str, content: str,
                        parent_id: str | None = None) -> Result:
-        payload: dict[str, Any] = {"content": content}
+        # 新接口按富文本 HTML 存储，这里把评论框里的纯文本转义成段落
+        payload: dict[str, Any] = {"content": _plain_to_html(content)}
         if parent_id:
             payload["parent_id"] = parent_id
-        return self.post("/api/posts/%s/comments/create" % post_id, payload)
+        path = "/ov2/api/posts/%s/comments" % post_id
+        result = self.post(path, payload)
+        if not result.ok and self._need_proof(result):
+            grant = self.altcha_grant()
+            if grant:
+                result = self.post(path, _with_proof(payload, grant=grant))
+        return result
 
     def like_comment(self, comment_id: str) -> Result:
-        return self.post("/api/comments/%s/like" % comment_id, {})
+        return self.post("/ov2/api/comments/%s/like" % comment_id, {})
 
     def delete_comment(self, comment_id: str) -> Result:
-        return self.post("/api/comments/%s/delete" % comment_id, {})
+        return self.delete("/ov2/api/comments/%s" % comment_id)
 
     def report_comment(self, comment_id: str, reason: str, detail: str = "") -> Result:
+        # 新 API 暂未提供评论举报端点，继续走旧 APP 兼容层（与帖子举报共用审核表）。
         return self.post("/api/comments/%s/report" % comment_id,
                          {"reason": reason, "detail": detail})
 
     # ─────────────── 搜索 ───────────────
     def search(self, keyword: str, page: int = 1, page_size: int = 20,
                type_: str = "both") -> Result:
-        return self.get("/api/search", k=keyword, page=page,
+        return self.get("/ov2/api/search", k=keyword, page=page,
                         page_size=page_size, type=type_)
 
     # ─────────────── 世界频道 ───────────────
     def world_all(self) -> Result:
-        return self.get("/api/world/ALL")
+        result = self.get("/ov2/api/world/messages", limit=200)
+        if not result.ok:
+            return result
+        items = []
+        for raw in result.rows("items"):
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            if item.get("content_format") == "html":
+                item["content"] = _plain_text(item.get("content"))
+            items.append(item)
+        # 旧页面按「直接是数组」的响应渲染，这里保持同一契约
+        return Result(result.status, items, None, result.url)
 
     def world_send(self, content: str, parent_id: str | None = None) -> Result:
-        payload: dict[str, Any] = {"content": content}
+        # 新接口接收富文本；世界频道输入框是纯文本，转义后再存
+        payload: dict[str, Any] = {"content_html": _plain_to_html(content)}
         if parent_id:
             payload["parent_id"] = parent_id
-        return self.post("/api/world/Send", payload)
+        return self.post("/ov2/api/world/messages", payload)
+
+    # ─────────────── 消息中心 ───────────────
+    def message_summary(self) -> Result:
+        return self.get("/ov2/api/messages/summary")
+
+    def message_likes(self, cursor: str = "", limit: int = 20) -> Result:
+        return self.get("/ov2/api/messages/likes", cursor=cursor, limit=limit)
+
+    def message_comments(self, cursor: str = "", limit: int = 20) -> Result:
+        return self.get("/ov2/api/messages/comments", cursor=cursor, limit=limit)
+
+    def message_system(self, cursor: str = "", limit: int = 20) -> Result:
+        return self.get("/ov2/api/messages/system", cursor=cursor, limit=limit)
+
+    def mark_messages_read(self, category: str, last_read_at: str = "") -> Result:
+        return self.post("/ov2/api/messages/read", {
+            "category": category, "last_read_at": last_read_at})
+
+    def chat_messages(self, cursor: str = "", limit: int = 20) -> Result:
+        return self.get("/ov2/api/messages/chat", cursor=cursor, limit=limit)
+
+    def send_chat(self, content_html: str) -> Result:
+        return self.post("/ov2/api/messages/chat", {"content_html": content_html})
+
+    def mark_chat_read(self, last_message_id: int) -> Result:
+        return self.post("/ov2/api/messages/chat/read",
+                         {"last_message_id": int(last_message_id)})
+
+    # ─────────────── 人机验证（ALTCHA v2）───────────────
+    def altcha_grant(self, force: bool = False) -> str:
+        """取一个可复用的 ALTCHA grant（本地求解 challenge 后兑换，10 分钟内复用）。"""
+        if not force:
+            cached = getattr(self, "_altcha_grant", "")
+            if cached and time.time() < getattr(self, "_altcha_expires", 0.0):
+                return cached
+        challenge = self.get("/ov2/api/captcha/challenge")
+        if not challenge.ok or not isinstance(challenge.data, dict):
+            return ""
+        from . import altcha as altcha_mod
+        payload = altcha_mod.solve_payload(challenge.data)
+        if not payload:
+            return ""
+        verified = self.post("/ov2/api/captcha/verify", {"altcha": payload},
+                             retries=1)
+        grant = str(verified.get("grant") or "") if verified.ok else ""
+        if grant:
+            ttl = int(verified.get("expires_in") or 600)
+            self._altcha_grant = grant
+            self._altcha_expires = time.time() + max(ttl - 15, 30)
+        return grant
+
+    @staticmethod
+    def _need_proof(result: Result) -> bool:
+        message = str(result.message or "")
+        return "人机验证" in message or "CAPTCHA" in message.upper()
 
     # ─────────────── 杂项 ───────────────
     def easter_egg(self) -> Result:
-        return self.get(constants.EASTER_EGG_PATH)
+        return self.get("/ov2/api/easter-egg")
 
     def huiguan(self) -> Result:
+        # 新 API 用动态会馆（/ov2/api/guilds）替代静态 huiguan.json，页面契约不同，
+        # 这里继续走旧 APP 兼容层读取静态列表。
         return self.get("/api/huiguan")
 
     def report_bug(self, title: str, detail: str, steps: str = "",
                    contact: str = "", page_url: str = "") -> Result:
-        return self.post("/api/report-bug", {
+        payload = {
             "title": title, "detail": detail, "steps": steps,
-                "contact": contact, "page_url": page_url or constants.BASE_URL,
-        })
+            "contact": contact, "page_url": page_url or constants.BASE_URL,
+        }
+        result = self.post("/ov2/api/reports/bug", payload)
+        if not result.ok and self._need_proof(result):
+            grant = self.altcha_grant()
+            if grant:
+                result = self.post("/ov2/api/reports/bug",
+                                   _with_proof(payload, grant=grant))
+        return result
+
     def healthz(self) -> Result:
         return self.get("/healthz")
 

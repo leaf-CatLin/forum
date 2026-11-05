@@ -10,6 +10,9 @@ PyQt6-WebEngine==6.11.0
 # HTTP（唯一出网库，负责 Cookie / 会话 / 流式下载）
 requests==2.34.2
 
+# 发帖：编辑器的 Markdown 转成新 API 存储的富文本 HTML
+markdown==3.10.2
+
 # Live2D 原生渲染（桌宠）
 live2d-py==0.7.0.4
 PyOpenGL==3.1.10
